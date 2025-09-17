@@ -2,6 +2,7 @@ import os
 import json
 import time
 import requests
+from uuid import uuid4
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from pycti import OpenCTIApiClient
@@ -30,11 +31,14 @@ TV1_INDUSTRY        = os.getenv("TV1_INDUSTRY", "No specified industries")
 
 DEBUG               = os.getenv("DEBUG", "0") == "1"
 
+# Optional: keep bundles at a sane size for OpenCTI imports.
+MAX_OBJECTS_PER_BUNDLE = int(os.getenv("MAX_OBJECTS_PER_BUNDLE", "5000"))
+
 def to_iso_z(dt: datetime) -> str:
     # match your sample with milliseconds set to .000Z
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-def log(*a): 
+def log(*a):
     if DEBUG: print(*a, flush=True)
 
 def get_json(session: requests.Session, url: str, headers: dict, params=None, max_retries=5):
@@ -47,6 +51,9 @@ def get_json(session: requests.Session, url: str, headers: dict, params=None, ma
             if "application/json" in ct:
                 return resp.json()
             raise RuntimeError(f"Unexpected content-type: {ct}")
+        if resp.status_code == 204:
+            # No content is a valid response → treat like empty page
+            return {"value": [], "nextLink": None}
         if resp.status_code in (429, 500, 502, 503, 504):
             time.sleep(backoff)
             backoff = min(backoff * 2, 16)
@@ -90,18 +97,59 @@ def collect_all(session, headers, params, debug=False) -> List[Dict[str, Any]]:
         page += 1
     return items
 
-def items_to_bundles(collected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Turn collected page items into a list of STIX bundles."""
-    bundles: List[Dict[str, Any]] = []
+def flatten_objects_from_items(collected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Pull STIX objects out of the common shapes we see:
+      A) {"envelope":{"objects":[...]}}  <-- your tenant returns this
+      B) {"content":{"type":"bundle","objects":[...]}}
+      C) {"type":"bundle","objects":[...]}
+      D) {"objects":[...]}  (raw)
+    Returns a flat list of STIX objects.
+    """
+    objs: List[Dict[str, Any]] = []
     for entry in collected:
-        # taxiiEnvelope style: each item has "content" that is a STIX bundle
-        if isinstance(entry, dict) and isinstance(entry.get("content"), dict) and entry["content"].get("type") == "bundle":
-            bundles.append(entry["content"])
+        if not isinstance(entry, dict):
             continue
-        # direct bundle per page
-        if isinstance(entry, dict) and entry.get("type") == "bundle":
-            bundles.append(entry)
+
+        # A) TAXII envelope (exactly like your working sample)
+        env = entry.get("envelope")
+        if isinstance(env, dict) and isinstance(env.get("objects"), list):
+            objs.extend(env["objects"])
             continue
+
+        # B) content as bundle
+        content = entry.get("content")
+        if isinstance(content, dict):
+            if content.get("type") == "bundle" and isinstance(content.get("objects"), list):
+                objs.extend(content["objects"])
+                continue
+            cenv = content.get("envelope")
+            if isinstance(cenv, dict) and isinstance(cenv.get("objects"), list):
+                objs.extend(cenv["objects"])
+                continue
+
+        # C) direct bundle on the item
+        if entry.get("type") == "bundle" and isinstance(entry.get("objects"), list):
+            objs.extend(entry["objects"])
+            continue
+
+        # D) raw objects list
+        if isinstance(entry.get("objects"), list):
+            objs.extend(entry["objects"])
+            continue
+
+    return objs
+
+def chunked_bundles(all_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split a flat object list into STIX bundles (≤ MAX_OBJECTS_PER_BUNDLE)."""
+    bundles: List[Dict[str, Any]] = []
+    if not all_objects:
+        return bundles
+    for i in range(0, len(all_objects), MAX_OBJECTS_PER_BUNDLE):
+        chunk = all_objects[i:i+MAX_OBJECTS_PER_BUNDLE]
+        if not chunk:
+            continue
+        bundles.append({"type": "bundle", "id": f"bundle--{uuid4()}", "objects": chunk})
     return bundles
 
 def run_once(client: OpenCTIApiClient):
@@ -113,6 +161,7 @@ def run_once(client: OpenCTIApiClient):
 
     # build session + headers
     session = requests.Session()
+    session.headers.update({"Accept": "application/json"})  # harmless & clearer intent
     headers = {
         "Authorization": f"Bearer {TV1_API_KEY}",
     }
@@ -121,7 +170,10 @@ def run_once(client: OpenCTIApiClient):
     else:
         # replicate your sample’s logic:
         # (location eq '<loc>' OR location eq 'No specified locations') AND industry eq '<industry>'
-        headers["TMV1-Contextual-Filter"] = f"(location eq '{TV1_LOCATION}' or location eq 'No specified locations') and industry eq '{TV1_INDUSTRY}'"
+        headers["TMV1-Contextual-Filter"] = (
+            f"(location eq '{TV1_LOCATION}' or location eq 'No specified locations') "
+            f"and industry eq '{TV1_INDUSTRY}'"
+        )
 
     base_params = {
         "responseObjectFormat": RESPONSE_FORMAT,   # "taxiiEnvelope" (default) or "stixBundle"
@@ -145,15 +197,17 @@ def run_once(client: OpenCTIApiClient):
         try:
             log(f"Trying: {label} | params={params}")
             collected = collect_all(session, headers, params, debug=DEBUG)
-            bundles = items_to_bundles(collected)
-            if not bundles:
-                # Maybe the API returned objects that aren't bundles; show preview for troubleshooting
-                preview = json.dumps(collected[:1], indent=2)[:800]
-                print("[WARN] No STIX bundles found in response. First item preview:\n", preview)
+
+            # NEW: flatten TAXII envelope & other shapes into STIX objects, then wrap into bundles
+            all_objs = flatten_objects_from_items(collected)
+            if not all_objs:
+                # If envelopes are empty, this is legit (no hits in that window/filter)
+                print("[INFO] No STIX objects in TAXII envelopes for current window/filter.")
                 return
-            total_objs = 0
+
+            bundles = chunked_bundles(all_objs)
+            total_objs = sum(len(b.get("objects", [])) for b in bundles)
             for b in bundles:
-                total_objs += len(b.get("objects", []))
                 client.stix2.import_bundle_from_json(b, update=True)
             print(f"[OK] Imported {len(bundles)} bundle(s), {total_objs} object(s) using {label}")
             return
