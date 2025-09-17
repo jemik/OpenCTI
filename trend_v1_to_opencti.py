@@ -155,25 +155,25 @@ def run_once(client: OpenCTIApiClient):
 
     last_error = None
     # try current region, then global as a final fallback
-    for root in (TV1_API_ROOT, "https://api.xdr.trendmicro.com"):
-        for fmt, top in ladders:
-            try:
-                _dbg(f"[DEBUG] Try api_root={root}, fmt={fmt}, top={top}")
-                collected = collect_all(root, start_iso, end_iso, fmt, top, contextual)
-                if not collected:
-                    print("[INFO] No results for current window/filter.")
-                    return
-                b, o = import_to_opencti(client, collected)
-                if b == 0 and o == 0:
-                    preview = json.dumps(collected[:1], indent=2)[:500]
-                    print("[WARN] No STIX bundles found; first item preview:\n", preview)
-                    return
-                print(f"[OK] Imported {b} bundle(s), {o} object(s) from {len(collected)} item(s) [{fmt}, top={top}]")
+    root = TV1_API_ROOT
+    for fmt, top in ladders:
+        try:
+            _dbg(f"[DEBUG] Try api_root={root}, fmt={fmt}, top={top}")
+            collected = collect_all(root, start_iso, end_iso, fmt, top, contextual)
+            if not collected:
+                print("[INFO] No results for current window/filter.")
                 return
-            except Exception as e:
-                last_error = e
-                _dbg(f"[DEBUG] Attempt failed: {e}")
-                time.sleep(1)
+            b, o = import_to_opencti(client, collected)
+            if b == 0 and o == 0:
+                preview = json.dumps(collected[:1], indent=2)[:500]
+                print("[WARN] No STIX bundles found; first item preview:\n", preview)
+                return
+            print(f"[OK] Imported {b} bundle(s), {o} object(s) from {len(collected)} item(s) [{fmt}, top={top}]")
+            return
+        except Exception as e:
+            last_error = e
+            _dbg(f"[DEBUG] Attempt failed: {e}")
+            time.sleep(1)
 
     print(f"[ERROR] All attempts failed. Last error: {last_error}")
 
