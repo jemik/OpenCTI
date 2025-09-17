@@ -161,48 +161,53 @@ def run_once(client: OpenCTIApiClient):
 
     # build session + headers
     session = requests.Session()
-    session.headers.update({"Accept": "application/json"})  # harmless & clearer intent
-    headers = {
-        "Authorization": f"Bearer {TV1_API_KEY}",
-    }
+    session.headers.update({"Accept": "application/json"})
+    headers = {"Authorization": f"Bearer {TV1_API_KEY}"}
     if USER_FILTER:
         headers["TMV1-Contextual-Filter"] = USER_FILTER
     else:
-        # replicate your sample’s logic:
-        # (location eq '<loc>' OR location eq 'No specified locations') AND industry eq '<industry>'
         headers["TMV1-Contextual-Filter"] = (
             f"(location eq '{TV1_LOCATION}' or location eq 'No specified locations') "
             f"and industry eq '{TV1_INDUSTRY}'"
         )
 
     base_params = {
-        "responseObjectFormat": RESPONSE_FORMAT,   # "taxiiEnvelope" (default) or "stixBundle"
+        "responseObjectFormat": RESPONSE_FORMAT,
         "startDateTime": start_iso,
         "endDateTime": end_iso,
     }
 
-    # your fallback sizes order
     fallback_sizes = [TOP_REPORT_DEFAULT, 200, 100, 50, 25, 10]
-    tried = set()
-    last_err: Optional[Exception] = None
+    tried, last_err = set(), None
 
-    # fetch + import
     for size in fallback_sizes:
         if size in tried:
             continue
         tried.add(size)
-        params = dict(base_params)
-        params["topReport"] = size
-        label = f"topReport={size}, format={RESPONSE_FORMAT}, filter=ON, end=ON"
+        params = dict(base_params); params["topReport"] = size
+        label = f"topReport={size}, format={RESPONSE_FORMAT}, filter={'ON' if headers.get('TMV1-Contextual-Filter') else 'OFF'}"
         try:
-            log(f"Trying: {label} | params={params}")
+            log(f"Trying: {label} | window={start_iso}..{end_iso}")
             collected = collect_all(session, headers, params, debug=DEBUG)
 
-            # NEW: flatten TAXII envelope & other shapes into STIX objects, then wrap into bundles
+            # Metrics about what we actually got back
+            total_items = len(collected)
+            env_items = sum(1 for it in collected if isinstance(it, dict) and isinstance(it.get('envelope'), dict))
+            non_empty_env = 0
+            for it in collected:
+                if isinstance(it, dict) and isinstance(it.get('envelope'), dict):
+                    objs = it['envelope'].get('objects') or []
+                    if isinstance(objs, list) and len(objs) > 0:
+                        non_empty_env += 1
+            log(f"[METRICS] items={total_items}, with_envelope={env_items}, non_empty_envelope={non_empty_env}")
+
             all_objs = flatten_objects_from_items(collected)
             if not all_objs:
-                # If envelopes are empty, this is legit (no hits in that window/filter)
                 print("[INFO] No STIX objects in TAXII envelopes for current window/filter.")
+                # show a tiny preview to confirm shape
+                if DEBUG and total_items:
+                    preview = json.dumps(collected[0], indent=2)[:800]
+                    print("[DEBUG] First item preview:\n", preview)
                 return
 
             bundles = chunked_bundles(all_objs)
