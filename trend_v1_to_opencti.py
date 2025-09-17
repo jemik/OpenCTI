@@ -1,194 +1,181 @@
-import os, time, json, datetime, requests
-from typing import Dict, Any, List, Optional, Tuple
+import os
+import json
+import time
+import requests
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from pycti import OpenCTIApiClient
 
-# -------- env --------
+# -------- OpenCTI env --------
 OPENCTI_URL   = os.getenv("OPENCTI_URL")
 OPENCTI_TOKEN = os.getenv("OPENCTI_TOKEN")
 
-TV1_API_ROOT  = os.getenv("TV1_API_ROOT", "https://api.eu.xdr.trendmicro.com")
+# -------- Trend Vision One env --------
+URL_BASE      = os.getenv("TV1_API_ROOT", "https://api.eu.xdr.trendmicro.com").rstrip("/")
+URL_PATH      = "/v3.0/threatintel/feeds"
 TV1_API_KEY   = os.getenv("TV1_API_KEY")
-TV1_PATH_FEED = "/v3.0/threatintel/feeds"
-TV1_PATH_FDEF = "/v3.0/threatintel/feeds/filterDefinition"
 
-POLL_MINUTES      = int(os.getenv("POLL_MINUTES", "60"))
-SLEEP_SECONDS     = int(os.getenv("SLEEP_SECONDS", "900"))
-TOP_REPORT        = int(os.getenv("TOP_REPORT", "200"))
-RESPONSE_FORMAT   = os.getenv("RESPONSE_FORMAT", "taxiiEnvelope")  # start with envelope (more forgiving)
-USER_FILTER       = "location eq 'No specified locations' and industry eq 'No specified industries'"
-DEBUG             = os.getenv("DEBUG", "0") == "1"
+# -------- Feed options --------
+POLL_MINUTES        = int(os.getenv("POLL_MINUTES", "60"))
+RESPONSE_FORMAT     = os.getenv("RESPONSE_FORMAT", "taxiiEnvelope")  # or "stixBundle"
+TOP_REPORT_DEFAULT  = int(os.getenv("TOP_REPORT", "100"))            # requested per-page size
+SLEEP_SECONDS       = int(os.getenv("SLEEP_SECONDS", "900"))
 
-# -------- http --------
-http = requests.Session()
-http.headers.update({
-    "Authorization": f"Bearer {TV1_API_KEY}",
-    "Accept": "application/json",
-})
+# Contextual filter:
+# If TV1_CONTEXTUAL_FILTER is given, we use it as-is.
+# Else we construct the header from TV1_LOCATION / TV1_INDUSTRY (defaults match your sample).
+USER_FILTER         = (os.getenv("TV1_CONTEXTUAL_FILTER") or "").strip()
+TV1_LOCATION        = os.getenv("TV1_LOCATION", "No specified locations")
+TV1_INDUSTRY        = os.getenv("TV1_INDUSTRY", "No specified industries")
 
-def _dbg(*a): 
+DEBUG               = os.getenv("DEBUG", "0") == "1"
+
+def to_iso_z(dt: datetime) -> str:
+    # match your sample with milliseconds set to .000Z
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def log(*a): 
     if DEBUG: print(*a, flush=True)
 
-# -------- time helpers --------
-def iso_now_ms() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-def iso_minus_minutes_ms(m: int) -> str:
-    return (datetime.datetime.utcnow() - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-# -------- filterDefinition → default contextual filter --------
-def get_default_filter(api_root: str) -> str:
-    try:
-        r = http.get(api_root + TV1_PATH_FDEF, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        loc_vals = data.get("location", []) or []
-        ind_vals = data.get("industry", []) or []
-        loc_default = next((v for v in loc_vals if v.lower().startswith("no specified")), "No specified locations")
-        ind_default = next((v for v in ind_vals if v.lower().startswith("no specified")), "No specified industries")
-        # permissive default = include “No specified …” too
-        return f"(location eq '{loc_default}' or location eq '{loc_default}') and industry eq '{ind_default}'"
-    except Exception as e:
-        _dbg("[DEBUG] filterDefinition fetch failed:", e)
-        return "(location eq 'No specified locations') and industry eq 'No specified industries'"
-
-# -------- GET with retries/backoff --------
-def get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], max_retries: int = 5) -> Dict[str, Any]:
+def get_json(session: requests.Session, url: str, headers: dict, params=None, max_retries=5):
     backoff = 1
-    last_err = ""
-    for attempt in range(1, max_retries + 1):
-        _dbg(f"[DEBUG] GET {url} params={params} headers={{...}} (attempt {attempt})")
-        try:
-            r = http.get(url, headers=headers, params=params, timeout=90)
-            ct = r.headers.get("Content-Type", "")
-            _dbg(f"[DEBUG] -> {r.status_code} CT={ct}")
-            if r.status_code == 204:
-                return {"value": [], "nextLink": None}
-            if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"{r.status_code}: transient; body={r.text[:500]}"
-                time.sleep(backoff); backoff = min(backoff * 2, 16); continue
-            if r.status_code == 400:
-                # surface server message
-                raise requests.HTTPError(f"400 BadRequest: {r.text[:800]}", response=r)
-            r.raise_for_status()
-            if "application/json" not in ct:
-                raise RuntimeError(f"Unexpected Content-Type: {ct}")
-            return r.json()
-        except requests.RequestException as e:
-            last_err = f"{type(e).__name__}: {e}"
-            time.sleep(backoff); backoff = min(backoff * 2, 16)
-    raise RuntimeError(f"Max retries exceeded: {last_err}")
+    for _ in range(max_retries):
+        resp = session.get(url, headers=headers, params=params, timeout=60)
+        ct = resp.headers.get("Content-Type", "")
+        log(f"[HTTP] {resp.status_code} {url}  CT={ct}")
+        if resp.status_code == 200:
+            if "application/json" in ct:
+                return resp.json()
+            raise RuntimeError(f"Unexpected content-type: {ct}")
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 16)
+            continue
+        # surface server error body for 400/401/etc.
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:1000]}")
+    raise RuntimeError("Max retries exceeded")
 
-# -------- page collector (follows nextLink absolute URL) --------
-def collect_all(api_root: str, start_iso: str, end_iso: str, fmt: str, top: int, contextual_filter: str) -> List[Dict[str, Any]]:
-    url = api_root + TV1_PATH_FEED
-    params = {
-        "startDateTime": start_iso,
-        "endDateTime": end_iso,
-        "topReport": max(1, min(int(top), 500)),
-        "responseObjectFormat": fmt,
-    }
-    headers = {}
-    # Always send contextual filter (some tenants 400 without it)
-    headers["TMV1-Contextual-Filter"] = contextual_filter
+def extract_items(payload):
+    # Exactly like your sample
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("value"), list):
+        return payload["value"]
+    return None
 
+def collect_all(session, headers, params, debug=False) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-    next_url: Optional[str] = url
-    next_params: Optional[Dict[str, Any]] = params
+    next_url = f"{URL_BASE}{URL_PATH}"
+    next_params = params
     page = 1
-
-    while next_url:
-        payload = get_json(next_url, headers, next_params or {})
-        # possible shapes: list, {"value":[...],"nextLink":...}, or a single dict/bundle
-        if isinstance(payload, list):
-            items.extend(payload); _dbg(f"[DEBUG] Page {page}: +{len(payload)} (total {len(items)})")
-        elif isinstance(payload, dict) and isinstance(payload.get("value"), list):
-            batch = payload["value"]; items.extend(batch); _dbg(f"[DEBUG] Page {page}: +{len(batch)} (total {len(items)})")
+    while True:
+        payload = get_json(session, next_url, headers, params=next_params)
+        arr = extract_items(payload)
+        if arr is not None:
+            items.extend(arr)
+            if debug:
+                print(f"Fetched page {page}: {len(arr)} items; total {len(items)}")
         else:
-            items.append(payload); _dbg(f"[DEBUG] Page {page}: appended single object (total {len(items)})")
-
+            if isinstance(payload, dict):
+                p = dict(payload)
+                p.pop("nextLink", None)
+                items.append(p)
+                if debug:
+                    print(f"Fetched page {page}: appended full page object (no 'value' array).")
         next_link = payload.get("nextLink") if isinstance(payload, dict) else None
-        if next_link:
-            next_url = next_link
-            next_params = None
-            page += 1
-        else:
+        if not next_link:
             break
-
+        next_url = next_link
+        next_params = None  # important: nextLink already has its own query
+        page += 1
     return items
 
-# -------- convert & import --------
-def import_to_opencti(client: OpenCTIApiClient, collected: List[Dict[str, Any]]) -> Tuple[int, int]:
-    bundles = 0
-    objects = 0
+def items_to_bundles(collected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Turn collected page items into a list of STIX bundles."""
+    bundles: List[Dict[str, Any]] = []
     for entry in collected:
-        # taxiiEnvelope: items -> {"content": {"type":"bundle", ...}}
-        content = entry.get("content") if isinstance(entry, dict) else None
-        if isinstance(content, dict) and content.get("type") == "bundle":
-            client.stix2.import_bundle_from_json(content, update=True)
-            bundles += 1
-            objects += len(content.get("objects", []))
+        # taxiiEnvelope style: each item has "content" that is a STIX bundle
+        if isinstance(entry, dict) and isinstance(entry.get("content"), dict) and entry["content"].get("type") == "bundle":
+            bundles.append(entry["content"])
             continue
-        # raw bundle
+        # direct bundle per page
         if isinstance(entry, dict) and entry.get("type") == "bundle":
-            client.stix2.import_bundle_from_json(entry, update=True)
-            bundles += 1
-            objects += len(entry.get("objects", []))
+            bundles.append(entry)
             continue
-    return bundles, objects
+    return bundles
 
 def run_once(client: OpenCTIApiClient):
-    end_iso, start_iso = iso_now_ms(), iso_minus_minutes_ms(POLL_MINUTES)
-    _dbg(f"[DEBUG] Window {start_iso} -> {end_iso}")
+    # build time window (UTC)
+    end_dt = datetime.utcnow()
+    start_dt = end_dt - timedelta(minutes=POLL_MINUTES)
+    start_iso = to_iso_z(start_dt)
+    end_iso   = to_iso_z(end_dt)
 
-    # contextual filter: use user’s, else build safe default from filterDefinition
-    contextual = USER_FILTER or get_default_filter(TV1_API_ROOT)
+    # build session + headers
+    session = requests.Session()
+    headers = {
+        "Authorization": f"Bearer {TV1_API_KEY}",
+    }
+    if USER_FILTER:
+        headers["TMV1-Contextual-Filter"] = USER_FILTER
+    else:
+        # replicate your sample’s logic:
+        # (location eq '<loc>' OR location eq 'No specified locations') AND industry eq '<industry>'
+        headers["TMV1-Contextual-Filter"] = f"(location eq '{TV1_LOCATION}' or location eq 'No specified locations') and industry eq '{TV1_INDUSTRY}'"
 
-    # fallback ladder: (format, topReport)
-    ladders = [
-        (RESPONSE_FORMAT, TOP_REPORT),
-        ("taxiiEnvelope", 200),
-        ("taxiiEnvelope", 100),
-        ("taxiiEnvelope", 50),
-        ("stixBundle", 200),
-        ("stixBundle", 100),
-    ]
+    base_params = {
+        "responseObjectFormat": RESPONSE_FORMAT,   # "taxiiEnvelope" (default) or "stixBundle"
+        "startDateTime": start_iso,
+        "endDateTime": end_iso,
+    }
 
-    last_error = None
-    # try current region, then global as a final fallback
-    root = TV1_API_ROOT
-    for fmt, top in ladders:
+    # your fallback sizes order
+    fallback_sizes = [TOP_REPORT_DEFAULT, 200, 100, 50, 25, 10]
+    tried = set()
+    last_err: Optional[Exception] = None
+
+    # fetch + import
+    for size in fallback_sizes:
+        if size in tried:
+            continue
+        tried.add(size)
+        params = dict(base_params)
+        params["topReport"] = size
+        label = f"topReport={size}, format={RESPONSE_FORMAT}, filter=ON, end=ON"
         try:
-            _dbg(f"[DEBUG] Try api_root={root}, fmt={fmt}, top={top}")
-            collected = collect_all(root, start_iso, end_iso, fmt, top, contextual)
-            if not collected:
-                print("[INFO] No results for current window/filter.")
+            log(f"Trying: {label} | params={params}")
+            collected = collect_all(session, headers, params, debug=DEBUG)
+            bundles = items_to_bundles(collected)
+            if not bundles:
+                # Maybe the API returned objects that aren't bundles; show preview for troubleshooting
+                preview = json.dumps(collected[:1], indent=2)[:800]
+                print("[WARN] No STIX bundles found in response. First item preview:\n", preview)
                 return
-            b, o = import_to_opencti(client, collected)
-            if b == 0 and o == 0:
-                preview = json.dumps(collected[:1], indent=2)[:500]
-                print("[WARN] No STIX bundles found; first item preview:\n", preview)
-                return
-            print(f"[OK] Imported {b} bundle(s), {o} object(s) from {len(collected)} item(s) [{fmt}, top={top}]")
+            total_objs = 0
+            for b in bundles:
+                total_objs += len(b.get("objects", []))
+                client.stix2.import_bundle_from_json(b, update=True)
+            print(f"[OK] Imported {len(bundles)} bundle(s), {total_objs} object(s) using {label}")
             return
         except Exception as e:
-            last_error = e
-            _dbg(f"[DEBUG] Attempt failed: {e}")
-            time.sleep(1)
+            if DEBUG:
+                print(f"Attempt failed ({label}): {e}")
+            last_err = e
+            continue
 
-    print(f"[ERROR] All attempts failed. Last error: {last_error}")
+    raise last_err if last_err else RuntimeError("All attempts failed")
 
 def main():
-    missing = [k for k in ("OPENCTI_URL","OPENCTI_TOKEN","TV1_API_KEY") if not os.getenv(k)]
-    if missing:
+    if not OPENCTI_URL or not OPENCTI_TOKEN or not TV1_API_KEY:
+        missing = [k for k,v in [("OPENCTI_URL",OPENCTI_URL),("OPENCTI_TOKEN",OPENCTI_TOKEN),("TV1_API_KEY",TV1_API_KEY)] if not v]
         raise SystemExit(f"Missing required env var(s): {', '.join(missing)}")
 
     client = OpenCTIApiClient(OPENCTI_URL, OPENCTI_TOKEN)
-
     while True:
         try:
             run_once(client)
         except Exception as e:
-            print(f"[ERROR] Unhandled: {e}")
+            print(f"[ERROR] {e}")
         time.sleep(SLEEP_SECONDS)
 
 if __name__ == "__main__":
