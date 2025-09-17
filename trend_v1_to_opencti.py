@@ -25,7 +25,7 @@ SLEEP_SECONDS       = int(os.getenv("SLEEP_SECONDS", "900"))
 # Contextual filter:
 # If TV1_CONTEXTUAL_FILTER is given, we use it as-is.
 # Else we construct the header from TV1_LOCATION / TV1_INDUSTRY (defaults match your sample).
-USER_FILTER         = (os.getenv("TV1_CONTEXTUAL_FILTER") or "").strip()
+USER_FILTER         = ("").strip()
 TV1_LOCATION        = os.getenv("TV1_LOCATION", "No specified locations")
 TV1_INDUSTRY        = os.getenv("TV1_INDUSTRY", "No specified industries")
 
@@ -161,59 +161,53 @@ def run_once(client: OpenCTIApiClient):
 
     # build session + headers
     session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
-    headers = {"Authorization": f"Bearer {TV1_API_KEY}"}
+    session.headers.update({"Accept": "application/json"})  # explicit
+    headers = {
+        "Authorization": f"Bearer {TV1_API_KEY}",
+    }
     if USER_FILTER:
         headers["TMV1-Contextual-Filter"] = USER_FILTER
     else:
+        # (location eq '<loc>' OR location eq 'No specified locations') AND industry eq '<industry>'
         headers["TMV1-Contextual-Filter"] = (
-            f"(location eq '{TV1_LOCATION}' or location eq 'No specified locations') "
+            f"(location eq 'No specified locations') "
             f"and industry eq '{TV1_INDUSTRY}'"
         )
 
     base_params = {
-        "responseObjectFormat": RESPONSE_FORMAT,
+        "responseObjectFormat": RESPONSE_FORMAT,   # "taxiiEnvelope" (default) or "stixBundle"
         "startDateTime": start_iso,
         "endDateTime": end_iso,
     }
 
+    # fallback sizes order (matches your sample tool)
     fallback_sizes = [TOP_REPORT_DEFAULT, 200, 100, 50, 25, 10]
-    tried, last_err = set(), None
+    tried = set()
+    last_err: Optional[Exception] = None
 
+    # fetch + import
     for size in fallback_sizes:
         if size in tried:
             continue
         tried.add(size)
-        params = dict(base_params); params["topReport"] = size
-        label = f"topReport={size}, format={RESPONSE_FORMAT}, filter={'ON' if headers.get('TMV1-Contextual-Filter') else 'OFF'}"
+        params = dict(base_params)
+        params["topReport"] = size
+        label = f"topReport={size}, format={RESPONSE_FORMAT}, filter=ON, end=ON"
         try:
-            log(f"Trying: {label} | window={start_iso}..{end_iso}")
+            log(f"Trying: {label} | params={params}")
             collected = collect_all(session, headers, params, debug=DEBUG)
 
-            # Metrics about what we actually got back
-            total_items = len(collected)
-            env_items = sum(1 for it in collected if isinstance(it, dict) and isinstance(it.get('envelope'), dict))
-            non_empty_env = 0
-            for it in collected:
-                if isinstance(it, dict) and isinstance(it.get('envelope'), dict):
-                    objs = it['envelope'].get('objects') or []
-                    if isinstance(objs, list) and len(objs) > 0:
-                        non_empty_env += 1
-            log(f"[METRICS] items={total_items}, with_envelope={env_items}, non_empty_envelope={non_empty_env}")
-
+            # Flatten TAXII envelopes & other shapes into STIX objects, then wrap into bundles
             all_objs = flatten_objects_from_items(collected)
             if not all_objs:
                 print("[INFO] No STIX objects in TAXII envelopes for current window/filter.")
-                # show a tiny preview to confirm shape
-                if DEBUG and total_items:
-                    preview = json.dumps(collected[0], indent=2)[:800]
-                    print("[DEBUG] First item preview:\n", preview)
                 return
 
             bundles = chunked_bundles(all_objs)
             total_objs = sum(len(b.get("objects", [])) for b in bundles)
             for b in bundles:
-                client.stix2.import_bundle_from_json(b, update=True)
+                # IMPORTANT: pycti expects a JSON string for import_bundle_from_json
+                client.stix2.import_bundle_from_json(json.dumps(b), update=True)
             print(f"[OK] Imported {len(bundles)} bundle(s), {total_objs} object(s) using {label}")
             return
         except Exception as e:
