@@ -47,7 +47,7 @@ The connector polls the Trend Micro Vision One Threat Intelligence Feed API (`/v
    ```
    Default admin user:
    ```
-   Email: admin@local
+   Email: admin@local.local
    Password: <printed by installer>
    ```
 
