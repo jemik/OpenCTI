@@ -60,14 +60,14 @@ All values can be customized via environment variables **before** running the in
 | Variable                    | Default                                | Description |
 |-----------------------------|----------------------------------------|-------------|
 | `OPENCTI_PORT`              | `8080`                                | Port for OpenCTI web UI |
-| `OPENCTI_ADMIN_EMAIL`       | `admin@local`                         | Initial admin email |
+| `OPENCTI_ADMIN_EMAIL`       | `admin@local.local`                   | Initial admin email |
 | `OPENCTI_ADMIN_PASS`        | (random)                              | Initial admin password |
 | `TV1_API_KEY`               | (required)                            | Trend Vision One API key |
 | `TV1_API_ROOT`              | `https://api.eu.xdr.trendmicro.com`   | API root (set region) |
 | `TV1_CONTEXTUAL_FILTER`     | (empty)                               | Optional contextual filter |
-| `CONNECTOR_POLL_MINUTES`    | `60`                                  | Time window for each poll |
+| `CONNECTOR_POLL_MINUTES`    | `4320`                                | Time window for each poll |
 | `CONNECTOR_SLEEP_SECONDS`   | `900` (15 min)                        | Delay between polls |
-| `CONNECTOR_TOP_REPORT`      | `1000`                                | Max items per request |
+| `CONNECTOR_TOP_REPORT`      | `100`                                 | Max items per request |
 | `CONNECTOR_RESPONSE_FORMAT` | `stixBundle`                          | `stixBundle` or `taxiiEnvelope` |
 
 ---
