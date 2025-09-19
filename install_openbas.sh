@@ -1,60 +1,80 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== STEP 0: settings =="
+# =========================================================
+# OpenBAS production stack (Postgres + MinIO + RabbitMQ + Redis + Elasticsearch)
+# Idempotent installer with doctor/reset/upgrade modes
+# =========================================================
+
+PROJECT="openbas"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/openbas-stack}"
 
-# Versions
+# -------- Versions (can be overridden via env) --------
 PG_VER="${PG_VER:-17-alpine}"
 MINIO_VER="${MINIO_VER:-RELEASE.2024-05-28T17-19-04Z}"
 RABBIT_VER="${RABBIT_VER:-3.13-management}"
 REDIS_VER="${REDIS_VER:-7-alpine}"
 ES_VER="${ES_VER:-8.17.4}"
-OPENBAS_VER="${OPENBAS_VER:-1.12.2}"  # set to your desired version
+OPENBAS_VER="${OPENBAS_VER:-1.12.2}"
 
-# Credentials (auto-generate if empty)
-POSTGRES_USER="${POSTGRES_USER:-openbas}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20 || echo p@ssw0rd)}"
+# -------- Defaults for first install only (persisted to .env) --------
+DEFAULT_POSTGRES_USER="openbas"
+DEFAULT_POSTGRES_PASSWORD="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20 || echo OpenbasPass123)"
+DEFAULT_MINIO_ROOT_USER="openbasminio"
+DEFAULT_MINIO_ROOT_PASSWORD="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20 || echo MinioPass123)"
+DEFAULT_RABBITMQ_DEFAULT_USER="openbas"
+DEFAULT_RABBITMQ_DEFAULT_PASS="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20 || echo RabbitPass123)"
+DEFAULT_OPENBAS_ADMIN_EMAIL="admin@example.com"
+DEFAULT_OPENBAS_ADMIN_PASSWORD="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16 || echo AdminPass123)"
+DEFAULT_OPENBAS_ADMIN_TOKEN="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen || echo 11111111-1111-1111-1111-111111111111)"
 
-MINIO_ROOT_USER="${MINIO_ROOT_USER:-openbasminio}"
-MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20 || echo MinioPass123)}"
+# BASE URL used by OpenBAS to generate links (set to server IP by default on first run)
+DEFAULT_OPENBAS_BASE_URL="${OPENBAS_BASE_URL:-http://$(hostname -I | awk '{print $1}'):4000}"
 
-RABBITMQ_DEFAULT_USER="${RABBITMQ_DEFAULT_USER:-openbas}"
-RABBITMQ_DEFAULT_PASS="${RABBITMQ_DEFAULT_PASS:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20 || echo RabbitPass123)}"
+# Optional mail
+DEFAULT_SPRING_MAIL_HOST="${SPRING_MAIL_HOST:-}"
+DEFAULT_SPRING_MAIL_PORT="${SPRING_MAIL_PORT:-}"
+DEFAULT_SPRING_MAIL_USERNAME="${SPRING_MAIL_USERNAME:-}"
+DEFAULT_SPRING_MAIL_PASSWORD="${SPRING_MAIL_PASSWORD:-}"
 
-OPENBAS_ADMIN_EMAIL="${OPENBAS_ADMIN_EMAIL:-admin@example.com}"
-OPENBAS_ADMIN_PASSWORD="${OPENBAS_ADMIN_PASSWORD:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16 || echo AdminPass123)}"
-OPENBAS_ADMIN_TOKEN="${OPENBAS_ADMIN_TOKEN:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen || echo 11111111-1111-1111-1111-111111111111)}"
-
-# Optional mail (leave blank if not needed)
-SPRING_MAIL_HOST="${SPRING_MAIL_HOST:-}"
-SPRING_MAIL_PORT="${SPRING_MAIL_PORT:-}"
-SPRING_MAIL_USERNAME="${SPRING_MAIL_USERNAME:-}"
-SPRING_MAIL_PASSWORD="${SPRING_MAIL_PASSWORD:-}"
-
-KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD:-ChangeMeKeystore}"
+DEFAULT_KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD:-ChangeMeKeystore}"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found"; exit 1; }; }
 
-echo "== STEP 1: preflight =="
-need_cmd docker
-if ! docker compose version >/dev/null 2>&1; then
-  echo "ERROR: Docker Compose plugin not found (try: sudo apt-get install docker-compose-plugin)"
-  exit 1
-fi
+preflight() {
+  echo "== STEP 1: preflight =="
+  need_cmd docker
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "ERROR: Docker Compose plugin not found (try: sudo apt-get install docker-compose-plugin)"
+    exit 1
+  fi
+  if [[ "$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)" -lt 262144 ]]; then
+    echo "[i] Setting vm.max_map_count=262144 (sudo)…"
+    sudo sysctl -w vm.max_map_count=262144 || true
+  fi
+}
 
-if [[ "$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)" -lt 262144 ]]; then
-  echo "[i] Setting vm.max_map_count=262144 (sudo)…"
-  sudo sysctl -w vm.max_map_count=262144 || true
-fi
+ensure_env() {
+  echo "== STEP 2: create working dir =="
+  mkdir -p "$INSTALL_DIR"
+  cd "$INSTALL_DIR"
+  echo "Working in $PWD"
 
-echo "== STEP 2: create working dir =="
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR" || exit 1
-echo "Working in $PWD"
-
-echo "== STEP 3: write .env =="
-cat > .env <<EOF
+  echo "== STEP 3: ensure .env =="
+  if [[ -f .env ]]; then
+    echo "[i] Reusing existing .env (secrets unchanged)"
+    set -a; . ./.env; set +a
+    # ensure version pins exist
+    grep -q '^PG_VER=' .env || echo "PG_VER=${PG_VER}" >> .env
+    grep -q '^MINIO_VER=' .env || echo "MINIO_VER=${MINIO_VER}" >> .env
+    grep -q '^RABBIT_VER=' .env || echo "RABBIT_VER=${RABBIT_VER}" >> .env
+    grep -q '^REDIS_VER=' .env || echo "REDIS_VER=${REDIS_VER}" >> .env
+    grep -q '^ES_VER=' .env || echo "ES_VER=${ES_VER}" >> .env
+    grep -q '^OPENBAS_VER=' .env || echo "OPENBAS_VER=${OPENBAS_VER}" >> .env
+    grep -q '^OPENBAS_BASE_URL=' .env || echo "OPENBAS_BASE_URL=${DEFAULT_OPENBAS_BASE_URL}" >> .env
+  else
+    echo "[i] Writing new .env (first install)"
+    cat > .env <<EOF
 # generated by install_openbas.sh
 PG_VER=${PG_VER}
 MINIO_VER=${MINIO_VER}
@@ -63,27 +83,50 @@ REDIS_VER=${REDIS_VER}
 ES_VER=${ES_VER}
 OPENBAS_VER=${OPENBAS_VER}
 
-POSTGRES_USER=${POSTGRES_USER}
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-MINIO_ROOT_USER=${MINIO_ROOT_USER}
-MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER}
-RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
+POSTGRES_USER=${DEFAULT_POSTGRES_USER}
+POSTGRES_PASSWORD=${DEFAULT_POSTGRES_PASSWORD}
+MINIO_ROOT_USER=${DEFAULT_MINIO_ROOT_USER}
+MINIO_ROOT_PASSWORD=${DEFAULT_MINIO_ROOT_PASSWORD}
+RABBITMQ_DEFAULT_USER=${DEFAULT_RABBITMQ_DEFAULT_USER}
+RABBITMQ_DEFAULT_PASS=${DEFAULT_RABBITMQ_DEFAULT_PASS}
 
-OPENBAS_ADMIN_EMAIL=${OPENBAS_ADMIN_EMAIL}
-OPENBAS_ADMIN_PASSWORD=${OPENBAS_ADMIN_PASSWORD}
-OPENBAS_ADMIN_TOKEN=${OPENBAS_ADMIN_TOKEN}
+OPENBAS_ADMIN_EMAIL=${DEFAULT_OPENBAS_ADMIN_EMAIL}
+OPENBAS_ADMIN_PASSWORD=${DEFAULT_OPENBAS_ADMIN_PASSWORD}
+OPENBAS_ADMIN_TOKEN=${DEFAULT_OPENBAS_ADMIN_TOKEN}
+OPENBAS_BASE_URL=${DEFAULT_OPENBAS_BASE_URL}
 
-SPRING_MAIL_HOST=${SPRING_MAIL_HOST}
-SPRING_MAIL_PORT=${SPRING_MAIL_PORT}
-SPRING_MAIL_USERNAME=${SPRING_MAIL_USERNAME}
-SPRING_MAIL_PASSWORD=${SPRING_MAIL_PASSWORD}
+SPRING_MAIL_HOST=${DEFAULT_SPRING_MAIL_HOST}
+SPRING_MAIL_PORT=${DEFAULT_SPRING_MAIL_PORT}
+SPRING_MAIL_USERNAME=${DEFAULT_SPRING_MAIL_USERNAME}
+SPRING_MAIL_PASSWORD=${DEFAULT_SPRING_MAIL_PASSWORD}
 
-KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD}
+KEYSTORE_PASSWORD=${DEFAULT_KEYSTORE_PASSWORD}
 EOF
+    set -a; . ./.env; set +a
+  fi
+}
 
-echo "== STEP 4: write docker-compose.yml =="
-cat > docker-compose.yml <<'YML'
+guard_pg_password_mismatch() {
+  # If PG data volume exists, verify current .env creds can auth
+  if docker volume ls --format '{{.Name}}' | grep -q "^${PROJECT}_pgsqldata$"; then
+    echo "[i] Detected existing Postgres volume — verifying credentials"
+    if ! docker compose -p "$PROJECT" exec -T pgsql bash -lc \
+      'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1" >/dev/null 2>&1'; then
+      cat <<'MSG'
+(!) Postgres volume exists, but the current POSTGRES_* credentials in .env cannot authenticate.
+    Fix one of these before continuing:
+      • Put the ORIGINAL password back into .env (POSTGRES_PASSWORD and SPRING_DATASOURCE_PASSWORD must match), OR
+      • Run: docker compose -p openbas down -v   (DESTROYS DB) then re-run this installer.
+MSG
+      exit 1
+    fi
+  fi
+}
+
+write_compose() {
+  echo "== STEP 4: write docker-compose.yml =="
+  cat > docker-compose.yml <<'YML'
+version: "3.9"
 services:
   pgsql:
     image: postgres:${PG_VER}
@@ -180,8 +223,8 @@ services:
       redis:
         condition: service_healthy
     environment:
-      # Base URL used by the app when building links (set to your server/IP)
-      OPENBAS_BASE-URL: http://<YOUR-SERVER-IP>:4000
+      # Base URL used by the app when building links
+      OPENBAS_BASE-URL: ${OPENBAS_BASE_URL}
       # Local auth / admin bootstrap
       OPENBAS_AUTH-LOCAL-ENABLE: "true"
       OPENBAS_ADMIN_EMAIL: ${OPENBAS_ADMIN_EMAIL}
@@ -199,7 +242,7 @@ services:
       OPENBAS_RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER}
       OPENBAS_RABBITMQ_PASS: ${RABBITMQ_DEFAULT_PASS}
 
-      # Elasticsearch (Engine) – correct keys
+      # Elasticsearch (Engine)
       ENGINE_ENGINE_SELECTOR: elk
       ENGINE_URL: http://elasticsearch:9200
 
@@ -207,8 +250,8 @@ services:
       MINIO_ENDPOINT: minio
       MINIO_PORT: "9000"
       MINIO_SECURE: "false"
-      MINIO_ACCESS-KEY: ${MINIO_ROOT_USER}
-      MINIO_ACCESS-SECRET: ${MINIO_ROOT_PASSWORD}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_ACCESS_SECRET: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: openbas
 
       # (optional) SMTP
@@ -220,13 +263,14 @@ services:
       # Keystore (internal)
       SERVER_SSL_KEY-STORE-PASSWORD: ${KEYSTORE_PASSWORD}
     ports:
-      - "4000:8080"   # <-- direct access by IP: http://<server-ip>:4000
+      - "4000:8080"   # access via http://<server-ip>:4000
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
       interval: 30s
       timeout: 10s
       retries: 10
+      start_period: 60s
 
 volumes:
   pgsqldata:
@@ -236,15 +280,112 @@ volumes:
   esdata:
 YML
 
-echo "== STEP 5: docker compose up =="
-docker compose -p openbas up -d
+  echo "== STEP 4b: validate compose =="
+  docker compose -p "$PROJECT" config >/dev/null
+}
 
-echo
-echo "== DONE =="
-echo "OpenBAS is starting. Give it a minute on first run."
-echo "Access URL:  http://<your-server-ip>:4000"
-echo
-echo "Admin creds:"
-echo "  Email   : ${OPENBAS_ADMIN_EMAIL}"
-echo "  Password: ${OPENBAS_ADMIN_PASSWORD}"
-echo "  API token (OpenCTI integration): ${OPENBAS_ADMIN_TOKEN}"
+up_stack() {
+  echo "== STEP 5: docker compose up =="
+  docker compose -p "$PROJECT" up -d
+
+  echo "== STEP 6: wait for OpenBAS to be healthy =="
+  ATTEMPTS=60
+  until curl -fsS "${OPENBAS_BASE_URL}/actuator/health" | grep -q '"status":"UP"'; do
+    ((ATTEMPTS--)) || { echo "(!) OpenBAS did not become healthy in time at ${OPENBAS_BASE_URL}"; exit 1; }
+    sleep 5
+  done
+  echo "[✔] OpenBAS is UP at ${OPENBAS_BASE_URL}"
+
+  # Optional: ensure S3 bucket exists (idempotent)
+  echo "== STEP 7: ensure MinIO bucket =="
+  docker compose -p "$PROJECT" exec -T minio sh -lc '
+    which mc >/dev/null 2>&1 || (curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc)
+    mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+    mc ls local/"openbas" >/dev/null 2>&1 || mc mb local/"openbas"
+  ' || true
+
+  echo
+  echo "== DONE =="
+  echo "Access URL:  ${OPENBAS_BASE_URL}"
+  echo
+  echo "Admin creds:"
+  echo "  Email   : ${OPENBAS_ADMIN_EMAIL}"
+  echo "  Password: ${OPENBAS_ADMIN_PASSWORD}"
+  echo "  API token (OpenCTI integration): ${OPENBAS_ADMIN_TOKEN}"
+}
+
+doctor() {
+  cd "$INSTALL_DIR" || { echo "Not installed in $INSTALL_DIR"; exit 1; }
+  echo "[*] Doctor"
+  docker compose -p "$PROJECT" ps || true
+  echo "--- openbas health ---"
+  curl -s "${OPENBAS_BASE_URL:-http://127.0.0.1:4000}/actuator/health" || true
+  echo -e "\n--- pgsql ping ---"
+  docker compose -p "$PROJECT" exec -T pgsql bash -lc 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1"' || true
+  echo -e "\n--- es health ---"
+  docker compose -p "$PROJECT" exec -T elasticsearch curl -sf http://localhost:9200/_cluster/health || true
+  echo -e "\n--- minio live ---"
+  docker compose -p "$PROJECT" exec -T minio curl -sf http://localhost:9000/minio/health/live || true
+  echo
+}
+
+reset_stack() {
+  cd "$INSTALL_DIR" || exit 0
+  echo "[!!] Resetting stack (down -v)…"
+  docker compose -p "$PROJECT" down -v || true
+  echo "[!!] Removing dangling volumes (if any)…"
+  docker volume ls --format '{{.Name}}' | grep "^${PROJECT}_" | xargs -r docker volume rm || true
+  echo "[!!] You can now re-run the installer (this DESTROYS DB data)."
+}
+
+upgrade_stack() {
+  cd "$INSTALL_DIR" || { echo "Not installed in $INSTALL_DIR"; exit 1; }
+  echo "[*] Pulling images…"
+  docker compose -p "$PROJECT" pull
+  echo "[*] Recreating containers…"
+  docker compose -p "$PROJECT" up -d
+  up_stack
+}
+
+restart_stack() {
+  cd "$INSTALL_DIR" || { echo "Not installed in $INSTALL_DIR"; exit 1; }
+  docker compose -p "$PROJECT" up -d
+  up_stack
+}
+
+main() {
+  CMD="${1:-install}"
+  case "$CMD" in
+    install)
+      preflight
+      ensure_env
+      guard_pg_password_mismatch
+      write_compose
+      up_stack
+      ;;
+    doctor)
+      doctor
+      ;;
+    reset)
+      reset_stack
+      ;;
+    upgrade)
+      preflight
+      ensure_env
+      write_compose
+      upgrade_stack
+      ;;
+    restart)
+      preflight
+      ensure_env
+      write_compose
+      restart_stack
+      ;;
+    *)
+      echo "Usage: $0 [install|doctor|reset|upgrade|restart]"
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
