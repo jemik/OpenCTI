@@ -126,7 +126,6 @@ MSG
 write_compose() {
   echo "== STEP 4: write docker-compose.yml =="
   cat > docker-compose.yml <<'YML'
-version: "3.9"
 services:
   pgsql:
     image: postgres:${PG_VER}
